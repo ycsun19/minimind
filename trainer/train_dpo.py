@@ -22,18 +22,18 @@ warnings.filterwarnings('ignore')
 
 
 def logits_to_log_probs(logits, labels):
-    # logits shape: (batch_size, seq_len, vocab_size)
-    # labels shape: (batch_size, seq_len)
+    # logits shape: (2batch_size, seq_len, vocab_size)
+    # labels shape: (2batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
-    log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
+    log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1) # 获取label所在idx对应的log_prob
     return log_probs_per_token
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
-    # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
+    # ref_log_probs 和 policy_log_probs 都是 shape: (2batch_size, seq_len) 值是负数
     ref_log_probs = (ref_log_probs * mask).sum(dim=1)
-    policy_log_probs = (policy_log_probs * mask).sum(dim=1)
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1) # mask确保只计算assistance回答部分的概率，忽略prompt
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
@@ -41,11 +41,13 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
-
+    # DPO公式 L= -logsigmoid(βlog(chosen) - βlog(reject)).i.e., log(chosen)是好答案奖励 log(reject)是坏答案奖励
+    # log(chosen) - log(reject) = log(policy/ref)_cho - log(policy/ref)_rej = 
+    # log(poli_cho) - log(ref_cho) - log(ploi_rej) + log(ref_rej) = pi_logratios - ref_logratios
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
-    loss = -F.logsigmoid(beta * logits)
+    loss = -F.logsigmoid(beta * logits) # 通常在0.1-0.5之间，β越小模型越疯狂允许偏离refmodel更多
     return loss.mean()
 
 
@@ -55,13 +57,13 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
 
     for step, batch in enumerate(loader, start=start_step + 1):
         last_step = step
-        x_chosen = batch['x_chosen'].to(args.device)
+        x_chosen = batch['x_chosen'].to(args.device) # (batch_size, seq_len)
         x_rejected = batch['x_rejected'].to(args.device)
         y_chosen = batch['y_chosen'].to(args.device)
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
-        x = torch.cat([x_chosen, x_rejected], dim=0)
+        x = torch.cat([x_chosen, x_rejected], dim=0) # (2batch_size, seq_len)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
@@ -72,8 +74,8 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         with autocast_ctx:
             with torch.no_grad():
                 ref_outputs = ref_model(x)
-                ref_logits = ref_outputs.logits
-            ref_log_probs = logits_to_log_probs(ref_logits, y)
+                ref_logits = ref_outputs.logits # (2batch_size, seq_len, vocab_size)
+            ref_log_probs = logits_to_log_probs(ref_logits, y) # (2atch_size, seq_len)
             
             outputs = model(x)
             logits = outputs.logits
@@ -115,7 +117,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
-
+        # 每个for循环python机制会自动释放变量X内存，但下次X=X_new时候会先申请一份X_new造成瞬时内存增加所以主动del
         del x_chosen, x_rejected, y_chosen, y_rejected, mask_chosen, mask_rejected, x, y, mask
         del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, loss
 
